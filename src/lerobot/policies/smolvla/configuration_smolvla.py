@@ -70,6 +70,16 @@ class SmolVLAConfig(PreTrainedConfig):
     train_expert_only: bool = True
     train_state_proj: bool = True
 
+    # C2: auxiliary depth reconstruction with weight on the auxiliary depth loss: L_total = L_flow + depth_loss_weight * L_depth.
+    # 0.0 disables the depth head.
+    depth_loss_weight: float = 0.0
+    # Edge length of the depth target grid the head reconstructs.
+    depth_target_size: int = 64
+    # Which image features the depth head reads:
+    #   "connector" — the 64 post-connector tokens (8x8 grid). Original C2 head.
+    #   "patches"   — the 1024 pre-connector SigLIP patches (32x32 grid).
+    depth_head_source: str = "connector"
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
