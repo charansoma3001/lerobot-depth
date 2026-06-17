@@ -188,7 +188,7 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.train_expert_only:
             self.vlm.eval()
 
-    def embed_image(self, image: torch.Tensor):
+    def embed_image(self, image: torch.Tensor, return_patches: bool = False):
         patch_attention_mask = None
         # Get sequence from the vision encoder
         image_hidden_states = (
@@ -199,8 +199,12 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             .last_hidden_state
         )
-        # Modality projection & resampling
+        # Pre-connector SigLIP patches: (B, num_patches, vision_hidden) = (B, 1024, 768) for a 512x512 image.
+        patches = image_hidden_states
+        # Modality projection & resampling -> (B, 64, text_hidden) connector tokens.
         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
+        if return_patches:
+            return image_hidden_states, patches
         return image_hidden_states
 
     def embed_language_tokens(self, tokens: torch.Tensor):

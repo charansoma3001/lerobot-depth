@@ -379,7 +379,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses, depth_pred = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        )
+
+        # C2: auxiliary depth reconstruction loss (MSE on the coarse [0,1] depth grid).
+        # depth_pred is None unless the depth head is enabled
+        depth_loss = None
+        if depth_pred is not None and OBS_DEPTH in batch:
+            depth_gt = batch[OBS_DEPTH].to(dtype=depth_pred.dtype, device=depth_pred.device)
+            depth_loss = F.mse_loss(depth_pred, depth_gt)
+
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -409,6 +419,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
+
+            # C2: combine flow and depth losses.
+            loss_dict["flow_loss"] = loss.item()
+            if depth_loss is not None:
+                loss_dict["depth_loss"] = depth_loss.item()
+                loss = loss + self.config.depth_loss_weight * depth_loss
+
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -538,6 +555,46 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
+OBS_DEPTH = "observation.depth"
+
+
+class DepthReconstructionHead(nn.Module):
+    """Auxiliary head that reconstructs a coarse depth map from image tokens (C2).
+
+    Reads a square grid of image features (row-major over the padded square image,
+    token t -> row t//grid, col t%grid, top->bottom, left->right) and predicts one
+    depth value per feature via a single linear layer, then bilinearly upsamples to
+    the target resolution. The grid edge is inferred from the feature count, so the
+    same head serves both depth_head_source settings:
+        "connector" - 64 connector tokens - 8x8  grid
+        "patches" - 1024 SigLIP patches - 32x32 grid (resolves small objects)
+    Both feature sets are row-major over the same (top-padded) square, and the depth
+    GT is built with SmolVLA's own resize_with_pad, so prediction and target stay
+    spatially aligned at either resolution.
+    """
+
+    def __init__(self, hidden_size: int, target_size: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, 1)
+        self.target_size = target_size
+
+    def forward(self, image_tokens: Tensor) -> Tensor:
+        # image_tokens: (B, num_tokens, hidden), num_tokens a perfect square.
+        bsize, num_tokens, _ = image_tokens.shape
+        grid = int(round(num_tokens**0.5))
+        if grid * grid != num_tokens:
+            raise ValueError(f"Expected a square token grid, got {num_tokens} tokens.")
+        x = self.proj(image_tokens)  # (B, num_tokens, 1)
+        x = x.view(bsize, 1, grid, grid)  # (B, 1, grid, grid) row-major = image layout
+        x = F.interpolate(
+            x.to(dtype=torch.float32),
+            size=(self.target_size, self.target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x[:, 0]  # (B, target_size, target_size)
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -593,6 +650,23 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
+        # C2: auxiliary depth head. Only built when enabled, reads either the connector or patches
+        self.depth_head = None
+        if self.config.depth_loss_weight > 0:
+            source = getattr(self.config, "depth_head_source", "connector")
+            if source == "patches":
+                head_hidden = self.vlm_with_expert.config.vision_config.hidden_size
+            elif source == "connector":
+                head_hidden = self.vlm_with_expert.config.text_config.hidden_size
+            else:
+                raise ValueError(
+                    f"depth_head_source must be 'connector' or 'patches', got {source!r}"
+                )
+            self.depth_head = DepthReconstructionHead(
+                hidden_size=head_hidden,
+                target_size=self.config.depth_target_size,
+            )
+
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -643,6 +717,8 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        # Raw connector image tokens for the C2 depth head.
+        image_embeddings = []
         for _img_idx, (
             img,
             img_mask,
@@ -662,8 +738,13 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+            # Keep the unscaled features the auxiliary depth head reads. The connector output (img_emb) is what feeds the prefix.
+            if self.depth_head is not None and getattr(self.config, "depth_head_source", "connector") == "patches":
+                img_emb, depth_feats = self.vlm_with_expert.embed_image(img, return_patches=True)
+                image_embeddings.append(depth_feats)
+            else:
+                img_emb = self.vlm_with_expert.embed_image(img)
+                image_embeddings.append(img_emb)
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -726,7 +807,7 @@ class VLAFlowMatching(nn.Module):
 
         att_masks = att_masks.expand(bsize, -1)
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, image_embeddings
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -784,7 +865,7 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_embeddings = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -807,7 +888,14 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+
+        # C2: predict a coarse depth map from the first camera's image tokens.
+        # None when the depth head is disabled (C1).
+        depth_pred = None
+        if self.depth_head is not None and len(image_embeddings) > 0:
+            depth_pred = self.depth_head(image_embeddings[0])
+
+        return losses, depth_pred
 
     def sample_actions(
         self,
@@ -827,7 +915,7 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
